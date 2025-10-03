@@ -44,8 +44,14 @@ class ShutdownHandler(metaclass=Singleton):
 
         Registers signal handlers for SIGTERM, SIGINT, and SIGHUP to ensure
         graceful shutdown when the application receives these signals.
+        SIGHUP is only available on Unix-like systems and is skipped on Windows.
         """
-        for sig in [signal.SIGTERM, signal.SIGINT, signal.SIGHUP]:
+        signals = [signal.SIGTERM, signal.SIGINT]
+        # SIGHUP is not available on Windows
+        if hasattr(signal, 'SIGHUP'):
+            signals.append(signal.SIGHUP)
+
+        for sig in signals:
             signal.signal(sig, self._signal_handler)
 
     def _signal_handler(self, signum: int, frame: Any) -> None:  # noqa: ARG002
