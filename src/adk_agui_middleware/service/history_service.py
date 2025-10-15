@@ -2,6 +2,7 @@
 """History service for managing conversation history and session retrieval."""
 
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import Request
 
@@ -109,7 +110,7 @@ class HistoryService:
             return await value(request)
         return value
 
-    async def list_threads(self, request: Request) -> list[dict[str, str]]:
+    async def list_threads(self, request: Request) -> list[dict[str, Any]]:
         """List conversation threads for the requesting user.
 
         Extracts user context from the request and returns a list of
@@ -132,13 +133,13 @@ class HistoryService:
         """Delete a specific conversation thread for the user.
 
         Extracts session context from the request and deletes the specified
-        conversation thread, returning the updated list of available threads.
+        conversation thread, returning a status confirmation payload.
 
         Args:
             :param request: HTTP request containing session context
 
         Returns:
-            Updated list of dictionaries containing thread information
+            Dictionary containing deletion status confirmation
         """
         await (await self._create_history_handler(request)).delete_session(
             await self._get_session_id(request)

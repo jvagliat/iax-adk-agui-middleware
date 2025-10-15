@@ -17,10 +17,12 @@ from ..base_abc.sse_service import BaseSSEService
 from ..data_model.common import InputInfo
 from ..data_model.config import RunnerConfig
 from ..data_model.context import ConfigContext, HandlerContext
+from ..data_model.queue import EventQueue
 from ..data_model.session import SessionParameter
 from ..event.error_event import AGUIErrorEvent
 from ..event.event_translator import EventTranslator
 from ..handler.agui_user import AGUIUserHandler
+from ..handler.queue import QueueHandler
 from ..handler.running import RunningHandler
 from ..handler.session import SessionHandler
 from ..handler.user_message import UserMessageHandler
@@ -59,8 +61,6 @@ class SSEService(BaseSSEService):
         self.session_manager = SessionManager(
             session_service=self.runner_config.session_service
         )
-        self._runner_lock = asyncio.Lock()
-        self.runner_box: dict[str, Runner] = {}
         self.config_context = config_context
         self.handler_context = handler_context or HandlerContext()
         self.shutdown_handler = ShutdownHandler()
@@ -123,10 +123,10 @@ class SSEService(BaseSSEService):
 
         Args:
             :param inout_handler: Optional handler for recording and transforming output
-            :param output_data: Dictionary containing SSE event data to process
+            :param output_data: AGUI BaseEvent to process
 
         Returns:
-            Processed output data (potentially modified by handler)
+            BaseEvent (potentially modified by handler)
         """
         if inout_handler:
             await inout_handler.output_record(output_data)
@@ -228,31 +228,26 @@ class SSEService(BaseSSEService):
             return converter(AGUIErrorEvent.create_encoding_error_event(e))
 
     async def _create_runner(self, app_name: str) -> Runner:
-        """Create or retrieve a Runner instance for the specified application.
+        """Create a fresh ADK Runner instance for the provided app name.
 
-        Implements lazy initialization and caching of Runner instances per app.
-        Each app gets its own Runner with configured services.
+        Clones the agent to avoid cross-request state leakage and wires in
+        session, artifact, memory, and credential services from the runner config.
 
         Args:
-            :param app_name: Name of the application requiring a runner
+            :param app_name: Application name bound to the runner instance
 
         Returns:
-            Runner instance configured for the specified application
+            Configured Runner ready to execute agent operations
         """
-        async with self._runner_lock:
-            if app_name not in self.runner_box:
-                runner = Runner(
-                    app_name=app_name,
-                    agent=self.agent,
-                    session_service=self.session_manager.session_service,
-                    artifact_service=self.runner_config.get_artifact_service(),
-                    memory_service=self.runner_config.get_memory_service(),
-                    credential_service=self.runner_config.get_credential_service(),
-                    plugins=self.runner_config.plugins,
-                )
-                self.shutdown_handler.register_shutdown_function(runner.close)
-                self.runner_box[app_name] = runner
-            return self.runner_box[app_name]
+        return Runner(
+            app_name=app_name,
+            agent=self.agent.model_copy(deep=True),
+            session_service=self.session_manager.session_service,
+            artifact_service=self.runner_config.get_artifact_service(),
+            memory_service=self.runner_config.get_memory_service(),
+            credential_service=self.runner_config.get_credential_service(),
+            plugins=self.runner_config.plugins,
+        )
 
     async def get_runner(
         self, agui_content: RunAgentInput, request: Request
@@ -281,6 +276,12 @@ class SSEService(BaseSSEService):
             user_id=await self.extract_user_id(agui_content, request),
             session_id=await self.extract_session_id(agui_content, request),
             initial_state=await self.extract_initial_state(agui_content, request),
+            event_queue=QueueHandler(
+                EventQueue(
+                    adk_event_queue=asyncio.Queue(),
+                    agui_event_queue=asyncio.Queue(),
+                )
+            ),
         )
 
         async def runner() -> AsyncGenerator[BaseEvent]:
@@ -294,7 +295,7 @@ class SSEService(BaseSSEService):
                 return
 
             user_handler = AGUIUserHandler(
-                RunningHandler(
+                running_handler=RunningHandler(
                     runner=await self._create_runner(input_info.app_name),
                     run_config=self.runner_config.run_config,
                     handler_context=self.handler_context,
@@ -317,6 +318,7 @@ class SSEService(BaseSSEService):
                         session_id=input_info.session_id,
                     ),
                 ),
+                queue_handler=input_info.event_queue,
             )
             async for event in user_handler.run():
                 yield event
@@ -367,14 +369,3 @@ class SSEService(BaseSSEService):
         if self.config_context.event_source_response_mode:
             return EventSourceResponse(_generate())
         return StreamingResponse(cast(AsyncGenerator[str], _generate()))
-
-    async def close(self) -> None:
-        """Close all cached Runner instances and clean up resources.
-
-        Gracefully shuts down all cached Runner instances and clears the runner cache.
-        This method is thread-safe and uses a lock to prevent race conditions during shutdown.
-        """
-        async with self._runner_lock:
-            for runner in self.runner_box.values():
-                await runner.close()  # type: ignore[no-untyped-call]
-            self.runner_box.clear()

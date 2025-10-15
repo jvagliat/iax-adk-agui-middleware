@@ -10,6 +10,8 @@ from fastapi import HTTPException, Request, status
 
 from ..data_model.error import ErrorModel
 from ..loggers.record_request_log import record_request_error_log, record_request_log
+from ..manager.queue import QueueManager
+from .record_log import record_error_log
 
 
 def create_common_http_exception(
@@ -90,3 +92,53 @@ async def http_exception_handler(request: Request) -> AsyncGenerator[None, Any]:
         # Convert general exceptions to HTTP 500 errors
         await record_request_error_log(request, e)
         raise create_internal_server_error_exception({"error_message": repr(e)}) from e
+
+
+@asynccontextmanager
+async def adk_event_exception_handler(
+    queue_controller: QueueManager,
+) -> AsyncGenerator[None, Any]:
+    """Context manager for ADK event stream exception handling.
+
+    Ensures that ADK event streams always signal termination to the downstream
+    queue consumer, even when exceptions occur. Logs exceptions and forwards the
+    termination sentinel to the queue in a finally block.
+
+    Args:
+        :param queue_controller: QueueManager to receive the termination sentinel
+
+    Yields:
+        None – wraps the block that produces ADK events
+    """
+    try:
+        yield
+    except Exception as e:
+        record_error_log("ADK Event exception", e)
+        raise
+    finally:
+        await queue_controller.put(None)
+
+
+@asynccontextmanager
+async def agui_event_exception_handler(
+    queue_controller: QueueManager,
+) -> AsyncGenerator[None, Any]:
+    """Context manager for AGUI event stream exception handling.
+
+    Ensures that AGUI event streams always signal termination to the downstream
+    queue consumer, even when exceptions occur. Logs exceptions and forwards the
+    termination sentinel to the queue in a finally block.
+
+    Args:
+        :param queue_controller: QueueManager to receive the termination sentinel
+
+    Yields:
+        None – wraps the block that produces AGUI events
+    """
+    try:
+        yield
+    except Exception as e:
+        record_error_log("AGUI Event exception", e)
+        raise
+    finally:
+        await queue_controller.put(None)

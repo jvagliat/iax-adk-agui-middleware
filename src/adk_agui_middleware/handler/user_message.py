@@ -4,7 +4,7 @@
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from ag_ui.core import RunAgentInput, ToolMessage, UserMessage
+from ag_ui.core import RunAgentInput, Tool, ToolMessage, UserMessage
 from fastapi import Request
 from google.genai import types
 
@@ -71,8 +71,8 @@ class UserMessageHandler:
         active agent processing.
 
         Returns:
-            True if the most recent message is from a tool (HITL completion),
-            False for new user requests (potential HITL initiation)
+            ToolMessage if the most recent message is a tool result submission,
+            otherwise None for new user requests (potential HITL initiation)
 
         Note:
             This determines the HITL workflow branch: completion vs. initiation.
@@ -84,6 +84,18 @@ class UserMessageHandler:
             if isinstance(self.agui_content.messages[-1], ToolMessage)
             else None
         )
+
+    @property
+    def frontend_tools(self) -> list[Tool]:
+        """Return the list of frontend tools declared in the request.
+
+        These tools originate from the AGUI request payload and are exposed to the
+        agent as long-running frontend tools via the tool adapter layer.
+
+        Returns:
+            List of Tool objects provided by the client/frontend
+        """
+        return self.agui_content.tools
 
     async def init(self, tool_call_info: dict[str, str]) -> None:
         """Initialize the handler with tool call information for input conversion.

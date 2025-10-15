@@ -1,6 +1,7 @@
 # Copyright (C) 2025 Trend Micro Inc. All rights reserved.
 """Handler for managing AGUI user interactions and agent execution workflow."""
 
+import asyncio
 from collections.abc import AsyncGenerator
 
 from ag_ui.core import (
@@ -14,9 +15,14 @@ from google.adk.events import Event
 from google.genai import types
 
 from ..event.error_event import AGUIErrorEvent
+from ..loggers.exception import (
+    adk_event_exception_handler,
+    agui_event_exception_handler,
+)
 from ..utils.convert.agui_tool_message_to_adk_function_response import (
     convert_agui_tool_message_to_adk_function_response,
 )
+from .queue import QueueHandler
 from .running import RunningHandler
 from .session import SessionHandler
 from .user_message import UserMessageHandler
@@ -42,6 +48,7 @@ class AGUIUserHandler:
         running_handler: RunningHandler,
         user_message_handler: UserMessageHandler,
         session_handler: SessionHandler,
+        queue_handler: QueueHandler,
     ):
         """Initialize the AGUI user handler.
 
@@ -58,6 +65,9 @@ class AGUIUserHandler:
         self.running_handler = running_handler
         self.user_message_handler = user_message_handler
         self.session_handler = session_handler
+        self.queue_handler = queue_handler
+        self.adk_queue = queue_handler.get_adk_queue()
+        self.agui_queue = queue_handler.get_agui_queue()
 
         self.tool_call_info: dict[str, str] = {}
 
@@ -71,6 +81,20 @@ class AGUIUserHandler:
         self.tool_call_info = await self.session_handler.get_pending_tool_calls()
         self.running_handler.set_long_running_tool_ids(self.tool_call_info)
         await self.user_message_handler.init(self.tool_call_info)
+        self.running_handler.update_agent_tools(
+            self.agui_queue, self.user_message_handler.frontend_tools
+        )
+
+    async def _async_close(self) -> None:
+        """Close internal async resources created during the run.
+
+        Ensures the underlying runner and any associated resources are
+        gracefully closed after a workflow completes or aborts.
+
+        Raises:
+            Exception: Propagates exceptions from the underlying runner close
+        """
+        await self.running_handler.close()
 
     @property
     def app_name(self) -> str:
@@ -213,36 +237,47 @@ class AGUIUserHandler:
         self.input_message = result
         return None
 
-    async def _run_async(self) -> AsyncGenerator[BaseEvent]:
-        """Execute the agent asynchronously and yield translated events.
+    async def _run_async_with_adk(self) -> None:
+        """Run the ADK pipeline and push events onto the ADK queue.
 
-        Runs the agent with the user message, translates ADK events to AGUI events,
-        tracks tool calls, handles long-running tools early return, forces streaming
-        message closure, and creates final state snapshot if available.
-
-        This method implements the core agent execution loop with proper event
-        translation, tool call tracking, and state management.
-
-        Yields:
-            AGUI BaseEvent objects from agent execution and state management
+        Executes the agent via the running handler and forwards produced
+        ADK events to the ADK queue, guaranteeing a termination sentinel
+        is sent even if an exception occurs.
         """
-        async for adk_event in self.running_handler.run_async_with_adk(
-            user_id=self.user_id,
-            session_id=self.session_id,
-            new_message=self.input_message,
-        ):
-            async for agui_event in self.running_handler.run_async_with_agui(adk_event):
-                yield agui_event
-            if self.check_is_long_running_tool(adk_event):
-                return
-        async for ag_ui_event in self.running_handler.force_close_streaming_message():
-            yield ag_ui_event
-        if (
-            event_final_state := await self.running_handler.create_state_snapshot_event(
-                await self.session_handler.get_session_state()
-            )
-        ) is not None:
-            yield event_final_state
+        async with adk_event_exception_handler(self.adk_queue):
+            async for adk_event in self.running_handler.run_async_with_adk(
+                user_id=self.user_id,
+                session_id=self.session_id,
+                new_message=self.input_message,
+            ):
+                await self.adk_queue.put(adk_event)
+
+    async def _run_async_with_agui(self) -> None:
+        """Translate ADK events to AGUI events and push onto the AGUI queue.
+
+        Consumes ADK events from the ADK queue, translates them to AGUI
+        events via the running handler, and forwards them to the AGUI queue.
+        Guarantees a termination sentinel is sent even on exceptions.
+        """
+        async with agui_event_exception_handler(self.agui_queue):
+            async for adk_event in self.adk_queue.get_iterator():
+                async for agui_event in self.running_handler.run_async_with_agui(
+                    adk_event
+                ):
+                    await self.agui_queue.put(agui_event)
+                if self.check_is_long_running_tool(adk_event):
+                    return
+            async for (
+                ag_ui_event
+            ) in self.running_handler.force_close_streaming_message():
+                await self.agui_queue.put(ag_ui_event)
+            if (
+                event_final_state
+                := await self.running_handler.create_state_snapshot_event(
+                    await self.session_handler.get_session_state()
+                )
+            ) is not None:
+                await self.agui_queue.put(event_final_state)
 
     async def _run_workflow(self) -> AsyncGenerator[BaseEvent]:
         """Execute the complete agent workflow with session management.
@@ -261,8 +296,15 @@ class AGUIUserHandler:
         await self.session_handler.update_session_state(
             self.user_message_handler.initial_state
         )
-        async for event in self._run_async():
-            yield event
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self._run_async_with_adk())
+                tg.create_task(self._run_async_with_agui())
+                async for agui_event in self.agui_queue.get_iterator():
+                    yield agui_event
+        except* Exception as eg:
+            for exc in eg.exceptions:
+                yield AGUIErrorEvent.create_execution_error_event(exc)
         await self.session_handler.overwrite_pending_tool_calls(self.tool_call_info)
         yield self.call_finished()
 
@@ -289,3 +331,5 @@ class AGUIUserHandler:
                 yield event
         except Exception as e:
             yield AGUIErrorEvent.create_execution_error_event(e)
+        finally:
+            await self._async_close()

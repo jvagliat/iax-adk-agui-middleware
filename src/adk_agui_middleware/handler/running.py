@@ -5,7 +5,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
-from ag_ui.core import BaseEvent, StateSnapshotEvent
+from ag_ui.core import BaseEvent, StateSnapshotEvent, Tool
 from google.adk import Runner
 from google.adk.agents import RunConfig
 from google.adk.events import Event
@@ -25,6 +25,8 @@ from ..loggers.record_log import (
     record_event_raw_log,
     record_warning_log,
 )
+from ..manager.queue import QueueManager
+from ..tools.frontend_tool import FrontendToolset
 
 
 class RunningHandler:
@@ -238,6 +240,33 @@ class RunningHandler:
         async for agui_event in translate_func(adk_event):
             yield agui_event
 
+    def update_agent_tools(
+        self, agui_queue: QueueManager, frontend_tools: list[Tool]
+    ) -> None:
+        """Inject or merge frontend tools into the agent toolset without duplication.
+
+        Merges newly provided frontend Tool definitions into an existing FrontendToolset
+        if present on the agent; otherwise, appends a new FrontendToolset. Deduplication
+        is performed by tool name across existing BaseTool instances and existing
+        FrontendToolset.ag_ui_tools.
+        """
+        if (
+            not self.runner
+            or not hasattr(self.runner.agent, "tools")
+            or not frontend_tools
+        ):
+            return
+        agent = self.runner.agent
+        existing_tools = (
+            agent.tools
+            if isinstance(agent.tools, list)
+            else ([agent.tools] if agent.tools else [])
+        )
+        existing_names = {t.__name__ for t in existing_tools if hasattr(t, "__name__")}
+        if new_tools := [t for t in frontend_tools if t.name not in existing_names]:
+            existing_tools.append(FrontendToolset(agui_queue, new_tools))
+            agent.tools = existing_tools
+
     def set_long_running_tool_ids(self, long_running_tool_ids: dict[str, str]) -> None:
         """Set long-running tool IDs in the event translator.
 
@@ -351,3 +380,15 @@ class RunningHandler:
             record_agui_raw_log,
             self.agui_event_handler,
         )
+
+    async def close(self) -> None:
+        """Close the underlying ADK runner if it exists.
+
+        Ensures the Runner releases any resources (e.g., network connections),
+        making shutdown predictable and leak-free.
+
+        Raises:
+            Exception: Propagates exceptions raised by the runner's close method
+        """
+        if self.runner:
+            await self.runner.close()  # type: ignore[no-untyped-call]

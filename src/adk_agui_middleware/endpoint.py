@@ -32,7 +32,7 @@ def register_agui_endpoint(  # noqa: C901
         :param path_config: Configuration for endpoint paths (main, chat list, history)
 
     Raises:
-        Exception: Various exceptions are handled by exception_http_handler
+        Exception: Various exceptions are handled by http_exception_handler
     """
 
     if path_config is None:
@@ -54,7 +54,7 @@ def register_agui_endpoint(  # noqa: C901
             EventSourceResponse containing encoded agent events with appropriate media type
 
         Raises:
-            Exception: Handled by exception_http_handler context manager
+            Exception: Handled by http_exception_handler context manager
         """
         async with http_exception_handler(request):
             # Get configured runner for this specific request and content
@@ -82,7 +82,7 @@ def register_agui_history_endpoint(
         path_config = HistoryPathConfig()
 
     @app.get(path_config.agui_thread_list_path)
-    async def get_agui_thread_list(request: Request) -> list[dict[str, str]]:
+    async def get_agui_thread_list(request: Request) -> list[dict[str, Any]]:
         """Get list of available conversation threads for the user.
 
         Retrieves all available conversation threads/sessions for the requesting
