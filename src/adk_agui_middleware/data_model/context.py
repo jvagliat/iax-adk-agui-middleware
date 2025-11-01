@@ -18,7 +18,10 @@ from ..base_abc.handler import (
     SessionLockHandler,
 )
 from ..handler.session_lock_handler import DefaultSessionLockHandler
-from ..tools.default_session_id import default_session_id
+from ..tools.default_config_context import (
+    default_extract_initial_state,
+    default_session_id,
+)
 from .common import SessionLockConfig
 
 
@@ -87,10 +90,12 @@ class ConfigContext(BaseModel):
     )
     extract_initial_state: (
         Callable[[RunAgentInput, Request], Awaitable[dict[str, Any]]] | None
-    ) = None
+    ) = default_extract_initial_state
     convert_run_agent_input: (
         Callable[[RunAgentInput, dict[str, str]], Awaitable[RunAgentInput]] | None
     ) = None
     session_lock_config: SessionLockConfig = SessionLockConfig()
     event_source_response_mode: bool = False
     retune_on_stream_complete: bool = False
+    is_add_adk_event_in_agui_event: bool = False
+    auto_remove_agui_raw_event: bool = False
